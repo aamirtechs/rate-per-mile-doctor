@@ -1,0 +1,481 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rate Per Mile Doctor - AamirTechs</title>
+<style>
+:root{--navy:#0b1f3a;--gold:#d4a72c;--bg:#f6f8fb;--ink:#1c2733;--muted:#5b6b7c;--line:#d9e1ea}
+*{box-sizing:border-box}
+body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;background:var(--bg);color:var(--ink)}
+header{background:var(--navy);color:#fff;padding:28px 20px;border-bottom:4px solid var(--gold)}
+header .wrap{max-width:880px;margin:0 auto}
+header h1{margin:0 0 6px;font-size:1.6rem}
+header p{margin:0;color:#c8d4e4}
+main{max-width:880px;margin:24px auto;padding:0 20px}
+.card{background:#fff;border:1px solid var(--line);border-radius:12px;padding:20px;box-shadow:0 1px 3px rgba(11,31,58,.08)}
+label{display:block;font-weight:600;margin:14px 0 6px}
+.card>label:first-child{margin-top:0}
+textarea{width:100%;min-height:160px;padding:10px;border:1px solid var(--line);border-radius:8px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.85rem}
+input[type=text],input[type=number],select{padding:8px 10px;border:1px solid var(--line);border-radius:8px;font-size:.95rem;width:100%}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-top:4px}
+.grid label{margin:0 0 6px}
+.row{display:flex;flex-wrap:wrap;gap:10px;margin-top:16px}
+button{background:var(--navy);color:#fff;border:0;border-radius:8px;padding:10px 18px;font-size:.95rem;cursor:pointer}
+button.alt{background:#fff;color:var(--navy);border:1px solid var(--navy)}
+button.gold{background:var(--gold);color:#0b1f3a;font-weight:600}
+pre{background:#0b1f3a;color:#eef3f9;border-radius:8px;padding:16px;overflow-x:auto;white-space:pre;min-height:60px;font-size:.8rem}
+footer{max-width:880px;margin:0 auto 32px;padding:0 20px;color:var(--muted);font-size:.9rem}
+footer a{color:var(--navy)}
+.hint{color:var(--muted);font-size:.85rem;margin-top:6px;font-weight:400}
+</style>
+</head>
+<body>
+<header><div class="wrap"><h1>Rate Per Mile Doctor</h1><p>Compare truck loads against DAT national spot benchmarks by equipment type, using deadhead-adjusted rates per total mile.</p></div></header>
+<main><div class="card">
+<label for="file">Loads JSON file</label>
+<input type="file" id="file" accept=".json,application/json">
+<label for="input">Or paste the loads JSON</label>
+<textarea id="input" spellcheck="false" placeholder="Paste a JSON list of loads here, or load the sample."></textarea>
+<label for="file2">Benchmarks JSON file (optional, CLI --benchmarks)</label>
+<input type="file" id="file2" accept=".json,application/json">
+<label for="input2">Or paste the benchmarks JSON <span class="hint">Prefilled with the repo example benchmarks. Clear it to use the built-in DAT defaults.</span></label>
+<textarea id="input2" spellcheck="false">{
+  "dry van": 2.9,
+  "flatbed": 3.45,
+  "reefer": 3.4
+}</textarea>
+<div class="grid">
+<div><label for="opt-equipment">Equipment filter (CLI --equipment)</label><select id="opt-equipment"><option value="" selected>All equipment</option><option value="dry van">dry van</option><option value="reefer">reefer</option><option value="flatbed">flatbed</option></select></div>
+</div>
+<div class="row"><button class="gold" id="run" type="button">Run</button><button class="alt" id="sample" type="button">Load sample</button><button class="alt" id="download" type="button">Download report</button></div>
+<label for="out">Report</label>
+<pre id="out">Your report will appear here.</pre>
+</div></main>
+<footer>
+<p>Built by AamirTechs. <a href="https://aamirtechs.github.io/">All tools</a> | <a href="https://github.com/aamirtechs/rate-per-mile-doctor">Source</a></p>
+<p>Privacy: this tool runs 100% in your browser, nothing is uploaded.</p>
+</footer>
+<script id="core">
+// Pure logic port of rate_per_mile_doctor.py. No DOM access in this block.
+// Decimals are {c: BigInt coefficient, e: exponent} with value c * 10^e,
+// mirroring Python Decimal behaviour for the operations used here. Rates
+// and money are quantized to cents, half up, exactly like the CLI, and the
+// shortfall uses the unrounded rate (benchmark x total miles - gross pay).
+// window.runTool(inputText, options): inputText is the loads JSON text.
+// options.benchmarksText is the optional benchmarks JSON text (the CLI
+// --benchmarks file); an empty string means the built-in DAT defaults.
+// A benchmarks object holding a single entry, for example {"flatbed": 3.8},
+// reproduces the CLI --benchmark flatbed=3.80 override. options.equipment
+// is the CLI --equipment filter, or empty for all equipment.
+function Dec(v) {
+  if (v && typeof v === "object" && typeof v.c === "bigint") return v;
+  if (typeof v !== "string" && typeof v !== "number") throw new Error("not a number");
+  var s = String(v).trim();
+  var m = /^([+-]?)(?:(\d+)(?:\.(\d*))?|\.(\d+))(?:[eE]([+-]?\d+))?$/.exec(s);
+  if (!m) throw new Error("not a number: " + s);
+  var intPart = m[2] || "";
+  var fracPart = (m[3] !== undefined ? m[3] : (m[4] || ""));
+  var exp = (m[5] ? parseInt(m[5], 10) : 0) - fracPart.length;
+  var digits = (intPart + fracPart).replace(/^0+/, "");
+  if (digits === "") return { c: 0n, e: exp };
+  var c = BigInt(digits);
+  if (m[1] === "-") c = -c;
+  return { c: c, e: exp };
+}
+function decStr(d) {
+  if (d.c === 0n) {
+    if (d.e >= 0) return "0" + "0".repeat(d.e);
+    var z = "0.";
+    for (var i = 0; i < -d.e - 1; i++) z += "0";
+    return z + "0";
+  }
+  var neg = d.c < 0n;
+  var digits = (neg ? -d.c : d.c).toString();
+  var out;
+  if (d.e >= 0) out = digits + "0".repeat(d.e);
+  else {
+    var pos = digits.length + d.e;
+    if (pos > 0) out = digits.slice(0, pos) + "." + digits.slice(pos);
+    else out = "0." + "0".repeat(-pos) + digits;
+  }
+  return (neg ? "-" : "") + out;
+}
+function decAdd(a, b) {
+  var e = Math.min(a.e, b.e);
+  var ca = a.c * (10n ** BigInt(a.e - e));
+  var cb = b.c * (10n ** BigInt(b.e - e));
+  return { c: ca + cb, e: e };
+}
+function decSub(a, b) { return decAdd(a, { c: -b.c, e: b.e }); }
+function decMul(a, b) { return { c: a.c * b.c, e: a.e + b.e }; }
+function decCmp(a, b) {
+  var d = decSub(a, b);
+  return d.c < 0n ? -1 : (d.c > 0n ? 1 : 0);
+}
+function decDiv(a, b) {
+  if (b.c === 0n) throw new Error("division by zero");
+  if (a.c === 0n) return { c: 0n, e: 0 };
+  var neg = (a.c < 0n) !== (b.c < 0n);
+  var num = a.c < 0n ? -a.c : a.c;
+  var den = b.c < 0n ? -b.c : b.c;
+  var baseExp = a.e - b.e;
+  var s = 28 - (num.toString().length - den.toString().length);
+  var q = 0n;
+  for (var tries = 0; tries < 5; tries++) {
+    var N, Dd;
+    if (s >= 0) { N = num * (10n ** BigInt(s)); Dd = den; }
+    else { N = num; Dd = den * (10n ** BigInt(-s)); }
+    q = N / Dd;
+    var r = N % Dd;
+    var twice = r * 2n;
+    if (twice > Dd || (twice === Dd && (q & 1n) === 1n)) q += 1n;
+    var dl = q.toString().length;
+    if (dl === 28) break;
+    s += (28 - dl);
+  }
+  var e = baseExp - s;
+  while (q !== 0n && q % 10n === 0n) { q = q / 10n; e += 1; }
+  return { c: neg ? -q : q, e: e };
+}
+function decQuantize2(a) {
+  if (a.e === -2) return { c: a.c, e: -2 };
+  if (a.e > -2) return { c: a.c * (10n ** BigInt(a.e + 2)), e: -2 };
+  var div = 10n ** BigInt(-2 - a.e);
+  var neg = a.c < 0n;
+  var abs = neg ? -a.c : a.c;
+  var q = abs / div;
+  var r = abs % div;
+  if (r * 2n >= div) q += 1n;
+  return { c: neg ? -q : q, e: -2 };
+}
+function moneyDec(a) { return decQuantize2(a); }
+function rateDec(a) { return decQuantize2(a); }
+function pyRepr(v) {
+  if (v === null || v === undefined) return "None";
+  if (v === true) return "True";
+  if (v === false) return "False";
+  if (typeof v === "string") {
+    var esc = v.replace(/\\/g, "\\\\").replace(/\n/g, "\\n").replace(/\r/g, "\\r").replace(/\t/g, "\\t");
+    if (v.indexOf("'") >= 0 && v.indexOf('"') < 0) return '"' + esc + '"';
+    return "'" + esc.replace(/'/g, "\\'") + "'";
+  }
+  if (typeof v === "number") return String(v);
+  return JSON.stringify(v);
+}
+function pyStr(v) {
+  if (v === null || v === undefined) return "None";
+  if (v === true) return "True";
+  if (v === false) return "False";
+  return String(v);
+}
+function LoadError(msg) { this.message = msg; }
+LoadError.prototype = Object.create(Error.prototype);
+var BENCHMARK_SOURCE = "DAT national spot averages, linehaul plus fuel surcharge, week of Oct 24-30, 2026 (reported by The Trucker, 2026-11-04)";
+var EQUIPMENT_ALIASES = {
+  "dry van": "dry van", "dry-van": "dry van", "dryvan": "dry van", "van": "dry van",
+  "reefer": "reefer", "refrigerated": "reefer", "refrigerated van": "reefer",
+  "flatbed": "flatbed", "flat bed": "flatbed", "flat-bed": "flatbed"
+};
+function defaultBenchmarks() {
+  return { "dry van": Dec("3.07"), "reefer": Dec("3.63"), "flatbed": Dec("3.62") };
+}
+function toDecimalRPM(value, field, loadId) {
+  if (typeof value === "boolean") throw new LoadError("load " + loadId + ": " + field + " must be a number, got " + pyRepr(value));
+  if (typeof value === "number") {
+    if (!isFinite(value)) throw new LoadError("load " + loadId + ": " + field + " is not a number: " + pyRepr(value));
+    return Dec(String(value));
+  }
+  if (typeof value === "string") {
+    var text = value.trim().replace(/\$/g, "").replace(/,/g, "");
+    if (!text) throw new LoadError("load " + loadId + ": " + field + " is empty");
+    try { return Dec(text); }
+    catch (e) { throw new LoadError("load " + loadId + ": " + field + " is not a number: " + pyRepr(value)); }
+  }
+  throw new LoadError("load " + loadId + ": " + field + " must be a number, got " + pyRepr(value));
+}
+function normalizeEquipment(value, loadId) {
+  if (typeof value !== "string" || !value.trim()) throw new LoadError("load " + loadId + ": equipment is missing");
+  var key = value.trim().toLowerCase().replace(/\s+/g, " ");
+  var canonical = EQUIPMENT_ALIASES[key];
+  if (canonical === undefined) {
+    throw new LoadError("load " + loadId + ": unknown equipment " + pyRepr(value) + " (expected dry van, reefer, or flatbed)");
+  }
+  return canonical;
+}
+function hasKey(obj, key) { return Object.prototype.hasOwnProperty.call(obj, key); }
+function parseLoads(data) {
+  if (data && typeof data === "object" && !Array.isArray(data)) {
+    if (!hasKey(data, "loads")) throw new LoadError("input object must have a \"loads\" list");
+    data = data["loads"];
+  }
+  if (!Array.isArray(data)) throw new LoadError("input must be a JSON list of loads, or an object with a \"loads\" list");
+  if (!data.length) throw new LoadError("input contains no loads");
+  var seenIds = {};
+  var loads = [];
+  data.forEach(function (raw, index) {
+    var label = "at index " + index;
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+      throw new LoadError("load " + label + ": each load must be an object");
+    }
+    var rawId = raw["id"] || raw["load_id"] || raw["load_number"];
+    if (rawId === null || rawId === undefined || (typeof rawId === "string" && !rawId.trim())) {
+      throw new LoadError("load " + label + ": missing id (id, load_id, or load_number)");
+    }
+    var loadId = pyStr(rawId).trim();
+    if (hasKey(seenIds, loadId)) throw new LoadError("load " + loadId + ": duplicate id");
+    seenIds[loadId] = true;
+    if (!hasKey(raw, "loaded_miles")) throw new LoadError("load " + loadId + ": missing loaded_miles");
+    if (!hasKey(raw, "gross_pay")) throw new LoadError("load " + loadId + ": missing gross_pay");
+    if (!hasKey(raw, "equipment")) throw new LoadError("load " + loadId + ": missing equipment");
+    var loaded = toDecimalRPM(raw["loaded_miles"], "loaded_miles", loadId);
+    if (decCmp(loaded, Dec(0)) <= 0) throw new LoadError("load " + loadId + ": loaded_miles must be above 0, got " + decStr(loaded));
+    var deadhead = Dec(0);
+    if (raw["deadhead_miles"] !== null && raw["deadhead_miles"] !== undefined) {
+      deadhead = toDecimalRPM(raw["deadhead_miles"], "deadhead_miles", loadId);
+    }
+    if (decCmp(deadhead, Dec(0)) < 0) throw new LoadError("load " + loadId + ": deadhead_miles cannot be negative, got " + decStr(deadhead));
+    var gross = toDecimalRPM(raw["gross_pay"], "gross_pay", loadId);
+    if (decCmp(gross, Dec(0)) < 0) throw new LoadError("load " + loadId + ": gross_pay cannot be negative, got " + decStr(gross));
+    var equipment = normalizeEquipment(raw["equipment"], loadId);
+    var lane = (raw["lane"] === undefined) ? null : raw["lane"];
+    if (lane === null) {
+      var origin = raw["origin"] || "";
+      var destination = raw["destination"] || "";
+      if (origin || destination) lane = pyStr(origin) + " to " + pyStr(destination);
+    }
+    loads.push({
+      id: loadId,
+      lane: (typeof lane === "string") ? lane : null,
+      equipment: equipment,
+      loaded_miles: loaded,
+      deadhead_miles: deadhead,
+      gross_pay: moneyDec(gross)
+    });
+  });
+  return loads;
+}
+function evaluateLoad(load, benchmarks) {
+  var loaded = load["loaded_miles"];
+  var total = decAdd(loaded, load["deadhead_miles"]);
+  var gross = load["gross_pay"];
+  var benchmark = benchmarks[load["equipment"]];
+  var perLoaded = rateDec(decDiv(gross, loaded));
+  var perTotal = rateDec(decDiv(gross, total));
+  var diff = rateDec(decSub(perTotal, benchmark));
+  var below = decCmp(perTotal, benchmark) < 0;
+  var shortfall = Dec("0.00");
+  if (below) shortfall = moneyDec(decSub(decMul(benchmark, total), gross));
+  return {
+    id: load["id"], lane: load["lane"], equipment: load["equipment"],
+    loaded_miles: loaded, deadhead_miles: load["deadhead_miles"], total_miles: total,
+    gross_pay: moneyDec(gross), rate_per_loaded_mile: perLoaded, rate_per_total_mile: perTotal,
+    benchmark: benchmark, difference_per_mile: diff, shortfall: shortfall,
+    verdict: below ? "BELOW" : "ABOVE"
+  };
+}
+function summarize(results) {
+  var total = results.length;
+  var above = results.filter(function (r) { return r.verdict === "ABOVE"; }).length;
+  var below = total - above;
+  var belowRows = results.filter(function (r) { return r.verdict === "BELOW"; });
+  var totalShortfall = Dec("0.00");
+  belowRows.forEach(function (r) { totalShortfall = decAdd(totalShortfall, r.shortfall); });
+  var averageShortfall = Dec("0.00");
+  if (belowRows.length) averageShortfall = moneyDec(decDiv(totalShortfall, Dec(belowRows.length)));
+  var averagePerTotal = Dec("0.00"), averagePerLoaded = Dec("0.00");
+  if (results.length) {
+    var sumTotal = Dec(0), sumLoaded = Dec(0);
+    results.forEach(function (r) {
+      sumTotal = decAdd(sumTotal, r.rate_per_total_mile);
+      sumLoaded = decAdd(sumLoaded, r.rate_per_loaded_mile);
+    });
+    averagePerTotal = rateDec(decDiv(sumTotal, Dec(total)));
+    averagePerLoaded = rateDec(decDiv(sumLoaded, Dec(total)));
+  }
+  var best = null, worst = null;
+  results.forEach(function (r) {
+    if (best === null || decCmp(r.rate_per_total_mile, best.rate_per_total_mile) > 0) best = r;
+    if (worst === null || decCmp(r.rate_per_total_mile, worst.rate_per_total_mile) < 0) worst = r;
+  });
+  return {
+    total_loads: total, above_benchmark: above, below_benchmark: below,
+    average_rate_per_total_mile: averagePerTotal, average_rate_per_loaded_mile: averagePerLoaded,
+    total_shortfall: moneyDec(totalShortfall), average_shortfall_per_below_load: averageShortfall,
+    best_load: best ? best.id : null, best_rate_per_total_mile: best ? best.rate_per_total_mile : null,
+    worst_load: worst ? worst.id : null, worst_rate_per_total_mile: worst ? worst.rate_per_total_mile : null
+  };
+}
+function loadBenchmarks(benchmarksText) {
+  var benchmarks = defaultBenchmarks();
+  if (benchmarksText && String(benchmarksText).trim()) {
+    var data;
+    try { data = JSON.parse(benchmarksText); }
+    catch (e) { throw new LoadError("benchmarks input is not valid JSON: " + e.message); }
+    if (!data || typeof data !== "object" || Array.isArray(data)) {
+      throw new LoadError("benchmarks file must be a JSON object mapping equipment to rates");
+    }
+    Object.keys(data).forEach(function (key) {
+      var canonical = EQUIPMENT_ALIASES[String(key).trim().toLowerCase().replace(/\s+/g, " ")];
+      if (canonical === undefined) throw new LoadError("benchmarks file: unknown equipment " + pyRepr(key));
+      benchmarks[canonical] = toDecimalRPM(data[key], "benchmark", String(key));
+    });
+  }
+  ["dry van", "reefer", "flatbed"].forEach(function (equipment) {
+    var value = benchmarks[equipment];
+    if (decCmp(value, Dec(0)) <= 0) throw new LoadError("benchmark for " + equipment + " must be above 0, got " + decStr(value));
+  });
+  return benchmarks;
+}
+function ljust(s, w) { s = String(s); while (s.length < w) s += " "; return s; }
+function rjust(s, w) { s = String(s); while (s.length < w) s = " " + s; return s; }
+function formatRow(cols) {
+  var parts = [
+    ljust(cols[0], 8), ljust(cols[1], 9), rjust(cols[2], 7), rjust(cols[3], 9),
+    rjust(cols[4], 7), rjust(cols[5], 11), rjust(cols[6], 9), rjust(cols[7], 9),
+    rjust(cols[8], 10), rjust(cols[9], 9)
+  ];
+  return parts.join(" ") + "  " + cols[10];
+}
+function formatText(results, summary, benchmarks) {
+  var lines = [];
+  lines.push("Rate per mile vs DAT national spot benchmarks");
+  var benchText = ["dry van", "reefer", "flatbed"].map(function (name) {
+    return name + " $" + decStr(benchmarks[name]);
+  }).join(", ");
+  lines.push("Benchmarks: " + benchText + " per mile");
+  lines.push("Source: " + BENCHMARK_SOURCE);
+  lines.push("");
+  var header = formatRow(["ID", "Equipment", "Loaded", "Deadhead", "Total", "Gross pay", "$/loaded", "$/total", "Benchmark", "Diff/mi", "Verdict"]);
+  lines.push(header);
+  lines.push("-".repeat(header.length));
+  results.forEach(function (row) {
+    var diff = row.difference_per_mile;
+    var diffText = decCmp(diff, Dec(0)) >= 0 ? "+$" + decStr(diff) : "-$" + decStr({ c: -diff.c, e: diff.e });
+    lines.push(formatRow([
+      row.id, row.equipment, decStr(row.loaded_miles), decStr(row.deadhead_miles), decStr(row.total_miles),
+      "$" + decStr(row.gross_pay), "$" + decStr(row.rate_per_loaded_mile), "$" + decStr(row.rate_per_total_mile),
+      "$" + decStr(row.benchmark), diffText, row.verdict
+    ]));
+  });
+  lines.push("");
+  lines.push("Summary: " + summary.total_loads + " loads, " + summary.above_benchmark + " ABOVE benchmark, " + summary.below_benchmark + " BELOW benchmark");
+  lines.push("Average rate per total mile: $" + decStr(summary.average_rate_per_total_mile));
+  lines.push("Average rate per loaded mile: $" + decStr(summary.average_rate_per_loaded_mile));
+  if (summary.below_benchmark) {
+    lines.push("Average shortfall per below-benchmark load: $" + decStr(summary.average_shortfall_per_below_load) + " (total $" + decStr(summary.total_shortfall) + ")");
+  } else {
+    lines.push("No load is below benchmark. Total shortfall: $0.00");
+  }
+  lines.push("Best rate per total mile: " + summary.best_load + " at $" + decStr(summary.best_rate_per_total_mile));
+  lines.push("Worst rate per total mile: " + summary.worst_load + " at $" + decStr(summary.worst_rate_per_total_mile));
+  return lines.join("\n") + "\n";
+}
+window.runTool = function (inputText, options) {
+  options = options || {};
+  var benchmarks, loads;
+  try {
+    benchmarks = loadBenchmarks(options.benchmarksText || "");
+    var data;
+    try { data = JSON.parse(inputText == null ? "" : String(inputText)); }
+    catch (e) { return "error: input is not valid JSON: " + e.message + "\n"; }
+    loads = parseLoads(data);
+  } catch (e) { return "error: " + e.message + "\n"; }
+  if (options.equipment) {
+    loads = loads.filter(function (load) { return load.equipment === options.equipment; });
+    if (!loads.length) return "error: no " + options.equipment + " loads in input\n";
+  }
+  var results = loads.map(function (load) { return evaluateLoad(load, benchmarks); });
+  var summary = summarize(results);
+  return formatText(results, summary, benchmarks);
+};
+</script>
+<script>
+var SAMPLE = `[
+  {
+    "deadhead_miles": 60,
+    "equipment": "dry van",
+    "gross_pay": 2400,
+    "id": "L-201",
+    "lane": "Dallas, TX to Oklahoma City, OK",
+    "loaded_miles": 500
+  },
+  {
+    "deadhead_miles": 200,
+    "equipment": "dry van",
+    "gross_pay": 2300,
+    "id": "L-202",
+    "lane": "Houston, TX to Atlanta, GA",
+    "loaded_miles": 800
+  },
+  {
+    "deadhead_miles": 150,
+    "equipment": "reefer",
+    "gross_pay": 2850,
+    "id": "L-203",
+    "lane": "El Paso, TX to Phoenix, AZ",
+    "loaded_miles": 650
+  },
+  {
+    "deadhead_miles": 20,
+    "equipment": "flatbed",
+    "gross_pay": 1250,
+    "id": "L-204",
+    "lane": "Fort Worth, TX to Austin, TX",
+    "loaded_miles": 300
+  },
+  {
+    "deadhead_miles": 90,
+    "equipment": "reefer",
+    "gross_pay": 500,
+    "id": "L-205",
+    "lane": "Laredo, TX to San Antonio, TX",
+    "loaded_miles": 150
+  }
+]`;
+var SAMPLE_BENCHMARKS = `{
+  "dry van": 2.9,
+  "flatbed": 3.45,
+  "reefer": 3.4
+}`;
+var inputEl = document.getElementById("input");
+var input2El = document.getElementById("input2");
+var outEl = document.getElementById("out");
+var lastReport = "";
+function bindFile(id, target) {
+  document.getElementById(id).addEventListener("change", function (ev) {
+    var f = ev.target.files && ev.target.files[0];
+    if (!f) return;
+    var reader = new FileReader();
+    reader.onload = function () { target.value = String(reader.result || ""); };
+    reader.readAsText(f);
+  });
+}
+bindFile("file", inputEl);
+bindFile("file2", input2El);
+document.getElementById("sample").addEventListener("click", function () { inputEl.value = SAMPLE; input2El.value = SAMPLE_BENCHMARKS; });
+document.getElementById("run").addEventListener("click", function () {
+  var options = { benchmarksText: input2El.value, equipment: document.getElementById("opt-equipment").value || "" };
+  try {
+    lastReport = window.runTool(inputEl.value, options);
+    outEl.textContent = lastReport;
+  } catch (e) {
+    lastReport = "error: " + e.message + "\n";
+    outEl.textContent = lastReport;
+  }
+});
+document.getElementById("download").addEventListener("click", function () {
+  var text = lastReport || outEl.textContent;
+  var blob = new Blob([text], { type: "text/plain" });
+  var url = URL.createObjectURL(blob);
+  var a = document.createElement("a");
+  a.href = url;
+  a.download = "rate-per-mile-report.txt";
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+});
+</script>
+</body>
+</html>
